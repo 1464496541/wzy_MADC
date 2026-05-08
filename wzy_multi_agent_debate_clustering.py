@@ -23,6 +23,7 @@ import sys
 import asyncio
 import copy
 from collections import Counter
+from typing import Optional
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -48,12 +49,67 @@ try:
 except ImportError:
     SKLEARN_AVAILABLE = False
 
+# HDBSCAN 后端：sklearn>=1.3 内置，否则 fallback 到独立 hdbscan 包
+HDBSCAN_BACKEND = None
+_SK_HDBSCAN = None
+_hdbscan_pkg = None
+try:
+    from sklearn.cluster import HDBSCAN as _SK_HDBSCAN  # type: ignore
+    HDBSCAN_BACKEND = "sklearn"
+except ImportError:
+    try:
+        import hdbscan as _hdbscan_pkg  # type: ignore
+        HDBSCAN_BACKEND = "hdbscan"
+    except ImportError:
+        HDBSCAN_BACKEND = None
+
+# UMAP 后端：可选依赖；未安装时调用降维会抛 ImportError
+try:
+    import umap  # type: ignore
+    UMAP_AVAILABLE = True
+except ImportError:
+    UMAP_AVAILABLE = False
+
 # 配置
 MAJORITY_THRESHOLD = 0.6   # 聚类中多数投票的阈值：正确/错误占比 >= 60% 时生效
-TARGET_DIM = 128           # PCA 降维目标维度
+TARGET_DIM = 10            # PCA 降维目标维度（针对 LLM 句向量聚类的甜点：5~15 维）
 DBSCAN_EPS = 0.9          # DBSCAN 的 eps 参数
 DBSCAN_MIN_SAMPLES = 2    # DBSCAN 的 min_samples 参数
-KMEANS_K_FIXED = 7        # KMeans 固定聚类数
+
+# KMeans 固定聚类数：按降维方法分别配置，因为不同降维方法揭示的"自然簇数"不同
+# - PCA 是线性投影，不主动揭示簇结构 → 较大的 k 用来均匀切片
+# - UMAP 是非线性保拓扑，会把数据收缩成几个明显的"团" → k 应当 ≈ 团数
+# 对 50~120 step、10 agent 的场景，UMAP 的自然簇数大约 3~6
+KMEANS_K_FIXED_PCA = 7     # PCA 路径的经验值
+KMEANS_K_FIXED_UMAP = 4    # UMAP 路径，匹配 UMAP 的自然簇数
+KMEANS_K_FIXED = KMEANS_K_FIXED_PCA  # 向后兼容旧名
+
+# HDBSCAN 配置：兼容两条降维路径（PCA + L2 / UMAP 不 L2）
+# - min_cluster_size=3：允许 3 个 step 的少数派错误小簇被正式识别为 wrong，
+#   避免被吞为 noise 而失去 bidirectional 修正机会
+# - min_samples=2：core point 的最小邻居数，平衡噪声敏感度
+# - metric=euclidean：
+#     · PCA 路径：在 L2 归一化后，euclidean 与 cosine 单调等价
+#     · UMAP 路径：UMAP 输出本身是 manifold embedding，euclidean 是其自然度量
+HDBSCAN_MIN_CLUSTER_SIZE = 3
+HDBSCAN_MIN_SAMPLES = 2
+HDBSCAN_METRIC = "euclidean"
+
+# UMAP 降维参数：纯 UMAP 视角调优（不为对齐 PCA 妥协）
+# - n_components=10 落在 KMeans/DBSCAN/HDBSCAN 三种聚类的共同甜点
+# - n_neighbors=10 ≈ 期望同质簇大小（每条推理路径上 ~10 个相似 step），保留少数派
+# - min_dist=0.1 给簇内更宽松的呼吸空间，避免 HDBSCAN 因簇内点过密导致核心距离梯度被压平、
+#   簇边界判不准；调大此值可让簇间更分离，缓解过度合并
+# - metric=cosine 是 LLM embedding 的本征几何
+# - random_state=42 复现性；副作用：n_jobs 会自动变 1，N 小不影响速度
+# - pre_l2/post_l2 默认 OFF：cosine metric 已内置标度无关，不必再 L2
+UMAP_N_COMPONENTS = 10
+UMAP_N_NEIGHBORS = 10
+UMAP_MIN_DIST = 0.1
+UMAP_METRIC = "cosine"
+UMAP_RANDOM_STATE = 42
+UMAP_PRE_L2 = False        # UMAP 之前不做 L2（cosine metric 内置归一化处理）
+UMAP_POST_L2 = False       # UMAP 之后不做 L2（保留 UMAP manifold 几何）
 
 # IS_MATH: math_500_id 等数学数据集设为 True；BBH 选项格式任务设为 False
 IS_MATH = True
@@ -129,7 +185,6 @@ def get_majority_answer_from_contexts(agent_contexts: list, is_math: bool = IS_M
         return None
     return most_frequent(pred_answers)
 
-
 def get_majority_answer_from_latest(agent_contexts: list, is_math: bool = IS_MATH):
     """从各 agent 最新的 assistant 回复（context[-1]）多数投票得出参考答案。
 
@@ -155,9 +210,19 @@ def get_majority_answer_from_latest(agent_contexts: list, is_math: bool = IS_MAT
     return most_frequent(pred_answers)
 
 
-def _reduce_dimensions_pca(vectors: np.ndarray, target_dim: int = 128) -> np.ndarray:
+def _reduce_dimensions_pca(vectors: np.ndarray, target_dim: int = TARGET_DIM) -> np.ndarray:
     """
-    使用 PCA 对向量进行降维
+    针对 LLM 句向量的 PCA 降维。
+
+    设计要点：
+      1. 不使用 StandardScaler——逐维 z-score 会破坏 embedding 的余弦几何，并在小 N 下放大
+         "近常数维度"的噪声。PCA 内部已自动 centering，无需额外标准化。
+      2. PCA 前先做 L2 归一化——把所有向量投到单位球面，让 PCA 在 LLM embedding 的"母语
+         几何"（余弦/角距离）上工作；这样学到的主轴反映方向（语义）方差，而非长度方差。
+      3. 维度上限取 min(target_dim, N-1, original_dim)，N 较小时 PCA 自动收缩到 N-1。
+
+    下游会再做一次 L2 归一化（投影后向量长度不再为 1，需要重新拉回单位球以让聚类基于
+    余弦/角距离工作）。
 
     Args:
         vectors: 原始向量矩阵，形状 (N, dim)
@@ -166,17 +231,98 @@ def _reduce_dimensions_pca(vectors: np.ndarray, target_dim: int = 128) -> np.nda
     Returns:
         降维后的向量矩阵
     """
-    # 样本数少于 2 时不做降维（PCA 至少需要 2 个样本）
     if vectors.shape[0] < 2:
         return vectors
-    #对每列做标准化（减均值、除标准差）
-    scaler = StandardScaler()
-    # 计算实际可用的 PCA 维数 max_dim
-    vectors_scaled = scaler.fit_transform(vectors)
+
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    vectors_normed = vectors / (norms + 1e-12)
+
     max_dim = min(target_dim, vectors.shape[0] - 1, vectors.shape[1])
-    pca = PCA(n_components=max_dim)
-    reduced = pca.fit_transform(vectors_scaled)
-    print(f"[降维] PCA: {vectors.shape[1]} 维 -> {max_dim} 维，解释方差比: {pca.explained_variance_ratio_.sum():.2%}")
+    pca = PCA(n_components=max_dim, random_state=42)
+    reduced = pca.fit_transform(vectors_normed)
+    print(
+        f"[降维] PCA: {vectors.shape[1]} 维 -> {max_dim} 维，"
+        f"解释方差比: {pca.explained_variance_ratio_.sum():.2%}（PCA 前已 L2 归一化）"
+    )
+    return reduced
+
+
+def _reduce_dimensions_umap(
+    vectors: np.ndarray,
+    target_dim: int = UMAP_N_COMPONENTS,
+    n_neighbors: int = UMAP_N_NEIGHBORS,
+    min_dist: float = UMAP_MIN_DIST,
+    metric: str = UMAP_METRIC,
+    random_state: int = UMAP_RANDOM_STATE,
+    pre_l2: bool = UMAP_PRE_L2,
+) -> np.ndarray:
+    """
+    针对 LLM 句向量的 UMAP 降维。
+
+    设计要点：
+      1. metric=cosine 与 LLM embedding 的本征几何（方向）一致；cosine 公式内已归一化
+         分母，所以 pre_l2 默认 OFF（不做归一化），与 UMAP 作者建议一致。
+      2. min_dist=0.0：簇内最紧密、簇间最分离，利于下游 KMeans/HDBSCAN/DBSCAN 聚类。
+      3. n_neighbors=10：≈ 期望同质簇大小（每条推理路径上 ~10 个相似 step），既能保
+         留少数派子簇又不过分碎裂。
+      4. 小样本兜底：N<5 直接返回原向量；N<15 自动收缩 n_neighbors 与 n_components。
+      5. UMAP 输出本身已是优化过的 manifold embedding，下游不再做 L2 归一化（保留
+         UMAP 学到的几何结构）。
+
+    Args:
+        vectors: 原始向量矩阵，形状 (N, dim)
+        target_dim: 目标维度（实际值会被 N 自动收缩到 min(target_dim, N-2)）
+        n_neighbors: UMAP 局部邻域大小（小样本会被自动收缩到 N-1）
+        min_dist: 输出空间中点的最小间距
+        metric: 原空间距离度量
+        random_state: 随机种子（复现性）
+        pre_l2: 是否在 UMAP 前做 L2 归一化（默认 False）
+
+    Returns:
+        降维后的向量矩阵，形状 (N, n_components_eff)
+    """
+    if not UMAP_AVAILABLE:
+        raise ImportError(
+            "UMAP 未安装：请运行 'pip install umap-learn'；"
+            "或将 REDUCTION_METHOD 改回 'pca'"
+        )
+
+    n_samples = vectors.shape[0]
+    if n_samples < 5:
+        print(
+            f"[降维][UMAP] 跳过：样本数 {n_samples} < 5，UMAP 拟合不稳定，"
+            f"直接返回原向量"
+        )
+        return vectors
+
+    if pre_l2:
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        vectors = vectors / (norms + 1e-12)
+
+    # n_components: UMAP 要求 < N-1，对小 N 自动收缩
+    n_components_eff = min(target_dim, max(2, n_samples - 2), vectors.shape[1])
+    # n_neighbors: 必须 < N，对小 N 自动收缩；过小会让局部图退化
+    n_neighbors_eff = min(n_neighbors, max(2, n_samples - 1))
+
+    if n_samples < 15:
+        print(
+            f"[降维][UMAP][警告] 样本数 {n_samples} 偏小，自动收缩参数："
+            f"n_components={n_components_eff}, n_neighbors={n_neighbors_eff}"
+        )
+
+    reducer = umap.UMAP(
+        n_components=n_components_eff,
+        n_neighbors=n_neighbors_eff,
+        min_dist=min_dist,
+        metric=metric,
+        random_state=random_state,
+    )
+    reduced = reducer.fit_transform(vectors)
+    print(
+        f"[降维] UMAP: {vectors.shape[1]} 维 -> {n_components_eff} 维 "
+        f"(n_neighbors={n_neighbors_eff}, min_dist={min_dist}, "
+        f"metric={metric}, pre_l2={pre_l2})"
+    )
     return reduced
 
 
@@ -222,14 +368,28 @@ def _select_k_by_silhouette(vectors: np.ndarray) -> tuple[int, np.ndarray]:
     return best_k, best_labels
 
 
-def _cluster_kmeans(vectors: np.ndarray) -> np.ndarray:
-    """KMeans 聚类（k 固定为 KMEANS_K_FIXED）"""
+def _cluster_kmeans(
+    vectors: np.ndarray,
+    n_clusters: Optional[int] = None,
+) -> np.ndarray:
+    """KMeans 聚类。
+
+    Args:
+        vectors: 待聚类向量矩阵 (N, dim)
+        n_clusters: 期望聚类数；为 None 时使用 KMEANS_K_FIXED（向后兼容默认）。
+                    上层应根据降维方法传入合适的值（如 PCA→KMEANS_K_FIXED_PCA，
+                    UMAP→KMEANS_K_FIXED_UMAP）。
+    """
     if vectors.shape[0] < 2:
         return np.array([0] * vectors.shape[0])
-    n_clusters = min(KMEANS_K_FIXED, vectors.shape[0])
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    k_target = KMEANS_K_FIXED if n_clusters is None else n_clusters
+    n_clusters_eff = min(k_target, vectors.shape[0])
+    kmeans = KMeans(n_clusters=n_clusters_eff, random_state=42, n_init=10)
     labels = kmeans.fit_predict(vectors)
-    print(f"[KMeans] n_samples={vectors.shape[0]}, n_clusters={n_clusters} (固定), 聚类大小: {dict(Counter(labels))}")
+    print(
+        f"[KMeans] n_samples={vectors.shape[0]}, n_clusters={n_clusters_eff} "
+        f"(请求 k={k_target}), 聚类大小: {dict(Counter(labels))}"
+    )
     return labels
 
 
@@ -242,6 +402,71 @@ def _cluster_dbscan(vectors: np.ndarray, eps: float = 0.9, min_samples: int = 2)
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     n_noise = list(labels).count(-1)
     print(f"[DBSCAN] n_samples={vectors.shape[0]}, n_clusters={n_clusters}, 噪声点={n_noise}")
+    return labels
+
+
+def _cluster_hdbscan(
+    vectors: np.ndarray,
+    min_cluster_size: int = HDBSCAN_MIN_CLUSTER_SIZE,
+    min_samples: int = HDBSCAN_MIN_SAMPLES,
+    metric: str = HDBSCAN_METRIC,
+) -> np.ndarray:
+    """HDBSCAN 聚类。
+
+    与 DBSCAN 的关键差异：
+      - 不需要全局 eps（避免 DBSCAN 跨题不通用的痛点）
+      - 通过分层互达密度自适应不同密度区域
+      - 噪声点用 -1 标识，下游与 DBSCAN 共用同一套 noise 处理逻辑
+
+    后端兼容：优先 sklearn.cluster.HDBSCAN（sklearn>=1.3），
+              否则 fallback 到独立 hdbscan 包；二者 API 接近，统一返回 labels 数组。
+
+    Returns:
+        cluster_labels: shape (N,)，每个元素是该样本的簇 id；-1 表示噪声。
+    """
+    if vectors.shape[0] < 2:
+        return np.array([0] * vectors.shape[0])
+
+    if HDBSCAN_BACKEND is None:
+        raise RuntimeError(
+            "HDBSCAN 后端未安装：请升级 scikit-learn>=1.3 或 pip install hdbscan"
+        )
+
+    eff_min_cluster_size = max(2, min(min_cluster_size, vectors.shape[0]))
+    eff_min_samples = max(1, min(min_samples, vectors.shape[0]))
+
+    if HDBSCAN_BACKEND == "sklearn":
+        # copy=True：显式传入，避免 sklearn>=1.7 的 FutureWarning，并防止 fit_predict 原地修改 vectors。
+        clusterer = _SK_HDBSCAN(
+            min_cluster_size=eff_min_cluster_size,
+            min_samples=eff_min_samples,
+            metric=metric,
+            cluster_selection_method="eom",
+            copy=True,
+        )
+        labels = clusterer.fit_predict(vectors)
+    else:
+        clusterer = _hdbscan_pkg.HDBSCAN(
+            min_cluster_size=eff_min_cluster_size,
+            min_samples=eff_min_samples,
+            metric=metric,
+            cluster_selection_method="eom",
+        )
+        labels = clusterer.fit_predict(vectors)
+
+    labels = np.asarray(labels)
+    n_clusters = len(set(labels.tolist())) - (1 if -1 in labels else 0)
+    n_noise = int(np.sum(labels == -1))
+    print(
+        f"[HDBSCAN] n_samples={vectors.shape[0]}, n_clusters={n_clusters}, "
+        f"噪声点={n_noise}，参数: min_cluster_size={eff_min_cluster_size}, "
+        f"min_samples={eff_min_samples}, metric={metric}, backend={HDBSCAN_BACKEND}"
+    )
+    if vectors.shape[0] > 0 and n_noise / vectors.shape[0] > 0.5:
+        print(
+            f"[HDBSCAN][警告] 噪声点占比 {n_noise/vectors.shape[0]:.1%} > 50%，"
+            f"可能样本规模偏小或维度偏高；可考虑减小 min_cluster_size 或降低 PCA 目标维度"
+        )
     return labels
 
 
@@ -300,6 +525,129 @@ def _label_clusters_by_majority(
         else:
             cluster_labels_result[cluster_id] = "no_majority"
     return cluster_labels_result
+
+
+# ============================================================
+# 簇过度合并诊断
+# ============================================================
+
+# 阈值：超过即视为该项告警
+OVERMERGE_LARGEST_RATIO_THRESHOLD = 0.65   # 最大簇占非噪声 step 的比例
+OVERMERGE_NO_MAJORITY_RATIO_THRESHOLD = 0.5  # no_majority 簇占非噪声簇的比例
+OVERMERGE_MEAN_IMPURITY_THRESHOLD = 0.35   # 各簇 min(c_ratio, w_ratio) 的均值
+OVERMERGE_MIN_CLUSTERS_FOR_N = (30, 2)     # 当样本 >= 30 时，有效簇数 <= 2 视为告警
+
+
+def _diagnose_cluster_overmerge(
+    cluster_labels: np.ndarray,
+    cluster_label_results: dict,
+    step_indices: list,
+    all_steps: list,
+    method_name: str = "",
+) -> dict:
+    """计算 4 个互补指标，判断簇是否被过度合并并打印结论。
+
+    指标：
+      1. 有效簇数（排除噪声）：过少说明 UMAP 把多条推理路径压成一片
+      2. 最大簇占比：单一簇吞掉绝大多数 step → 典型巨型合并簇
+      3. no_majority 簇占比：簇内 correct/wrong 各占近一半 → 混合簇直接证据
+      4. 平均不纯度（mean impurity）：每簇 min(c_ratio, w_ratio) 的均值，越高越混
+
+    任意 ≥2 项告警 → 建议把 ``UMAP_MIN_DIST`` 调到 0.2 或更大。
+
+    Returns:
+        dict 含上述指标与告警标记，方便上层程序化使用。
+    """
+    arr = np.asarray(cluster_labels)
+    n_total = int(arr.shape[0])
+    n_noise = int(np.sum(arr == -1))
+    n_clustered = n_total - n_noise
+
+    real_cluster_ids = [int(c) for c in set(arr.tolist()) if int(c) != -1]
+    n_real_clusters = len(real_cluster_ids)
+
+    # 各簇大小、各簇 correct/wrong 计数
+    sizes: list[int] = []
+    impurities: list[float] = []
+    no_majority_cnt = 0
+    for cid in real_cluster_ids:
+        vec_idx = [i for i, c in enumerate(arr) if int(c) == cid]
+        sizes.append(len(vec_idx))
+        c_cnt = sum(1 for i in vec_idx if all_steps[step_indices[i]].get("is_correct") is True)
+        w_cnt = sum(1 for i in vec_idx if all_steps[step_indices[i]].get("is_correct") is False)
+        labeled = c_cnt + w_cnt
+        if labeled >= 2:
+            ratio = min(c_cnt, w_cnt) / labeled
+            impurities.append(ratio)
+        if cluster_label_results.get(cid) == "no_majority":
+            no_majority_cnt += 1
+
+    largest_size = max(sizes) if sizes else 0
+    largest_ratio = (largest_size / n_clustered) if n_clustered > 0 else 0.0
+    no_majority_ratio = (no_majority_cnt / n_real_clusters) if n_real_clusters > 0 else 0.0
+    mean_impurity = float(np.mean(impurities)) if impurities else 0.0
+
+    # 4 项告警判定
+    n_min, k_min = OVERMERGE_MIN_CLUSTERS_FOR_N
+    flag_too_few = (n_total >= n_min) and (n_real_clusters <= k_min)
+    flag_largest = largest_ratio > OVERMERGE_LARGEST_RATIO_THRESHOLD
+    flag_no_maj = no_majority_ratio > OVERMERGE_NO_MAJORITY_RATIO_THRESHOLD
+    flag_impure = mean_impurity > OVERMERGE_MEAN_IMPURITY_THRESHOLD
+    n_flags = sum([flag_too_few, flag_largest, flag_no_maj, flag_impure])
+
+    title = method_name or "簇过度合并诊断"
+    print(f"\n{'='*60}")
+    print(f"[{title}] 过度合并诊断")
+    print("="*60)
+    print(f"  总 step={n_total}, 噪声={n_noise}, 有效簇内 step={n_clustered}, 有效簇数={n_real_clusters}")
+    if sizes:
+        print(f"  各簇大小（降序）: {sorted(sizes, reverse=True)}")
+
+    def _mark(ok: bool) -> str:
+        return "✗" if ok else "✓"  # ✗=告警，✓=通过
+
+    print(
+        f"  [{_mark(flag_too_few)}] 有效簇数 ≤ {k_min}（且 N ≥ {n_min}）: {n_real_clusters}"
+    )
+    print(
+        f"  [{_mark(flag_largest)}] 最大簇占比 > {OVERMERGE_LARGEST_RATIO_THRESHOLD:.0%}: "
+        f"{largest_ratio:.1%}（最大簇 {largest_size} / 有效 {n_clustered}）"
+    )
+    print(
+        f"  [{_mark(flag_no_maj)}] no_majority 簇占比 > {OVERMERGE_NO_MAJORITY_RATIO_THRESHOLD:.0%}: "
+        f"{no_majority_ratio:.1%}（{no_majority_cnt}/{n_real_clusters}）"
+    )
+    print(
+        f"  [{_mark(flag_impure)}] 平均不纯度 > {OVERMERGE_MEAN_IMPURITY_THRESHOLD:.2f}: "
+        f"{mean_impurity:.3f}（每簇 min(c,w)/labeled 的均值）"
+    )
+
+    if n_flags >= 2:
+        print(
+            f"\n  [告警] 命中 {n_flags}/4 项 → 簇可能被过度合并；"
+            f"建议调整 UMAP_MIN_DIST 0.1 → 0.2（簇内更宽松、簇间更分离）"
+        )
+    elif n_flags == 1:
+        print(f"\n  [提示] 命中 1/4 项 → 边界情况，可暂不调整，多跑几道题观察")
+    else:
+        print(f"\n  [OK] 4 项均通过，当前簇结构无明显过度合并迹象")
+    print("="*60)
+
+    return {
+        "n_total": n_total,
+        "n_noise": n_noise,
+        "n_clustered": n_clustered,
+        "n_real_clusters": n_real_clusters,
+        "sizes": sizes,
+        "largest_ratio": largest_ratio,
+        "no_majority_ratio": no_majority_ratio,
+        "mean_impurity": mean_impurity,
+        "flag_too_few": flag_too_few,
+        "flag_largest": flag_largest,
+        "flag_no_majority": flag_no_maj,
+        "flag_mean_impurity": flag_impure,
+        "n_flags": n_flags,
+    }
 
 
 def _print_clustering_results(

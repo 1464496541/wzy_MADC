@@ -22,8 +22,10 @@ from wzy_multi_agent_debate_expand import get_expand_cache_entry
 # API configuration - please set your own API endpoint and key
 API_URL = "https://api.zhizengzeng.com/v1"
 API_KEY = "sk-zk2825bae2adf40f5eb42183b44b3e0630e69c2098d7527d"
-MODEL_NAME = "qwen2.5-7b-instruct"
-MODEL_TAG = "qwen2.5-7b-instruct"
+# MODEL_NAME = "qwen2.5-7b-instruct"
+# MODEL_TAG = "qwen2.5-7b-instruct"
+MODEL_NAME = "glm-4-flashx"
+MODEL_TAG = "glm-4-flashx"
 client = OpenAI(base_url=API_URL,
                        api_key=API_KEY,
                        )
@@ -1114,11 +1116,11 @@ async def main(agents,rounds,actions):
         data = [d for d in data if d['question_id'] in hard_id]
         eval_cnt = len(hard_id)
     else:
-        eval_cnt = 500
+        eval_cnt = 1
     fewshot_ost_config = read_json("prompt/fewshot_ost_config.json")
     fewshot_ost_prompt = read_txt("prompt/fewshot_ost_prompt.txt")
     # debate_zy_qwen2.5-7b-instruct_10_1_expand_agent_com0_False.json
-    expand_cache_path = "qwen2.5-7b-instruct/results/debate_zy/math_500_id/debate_zy_qwen2.5-7b-instruct_10_1_expand_agent_com0_False.json"
+    expand_cache_path = r"glm-4-flashx\results\debate_zy\math_500_id\debate_zy_glm-4-flashx_10_1_expand_agent_com0_False.json"
     with open(expand_cache_path, "r", encoding="utf-8") as f:
         expand_cache = json.load(f)
 
@@ -1218,6 +1220,7 @@ async def main(agents,rounds,actions):
             elif action == "exchangeI61":
                 agent_contexts_other = agent_contexts[:agent_idx] + agent_contexts[agent_idx+1:]
                 message = construct_exchangeI61_message(agent_contexts_other, question, round)
+                print("message:",message)
                 agent_context.append(message)  
             elif action == "exchangeI7":
                 agent_contexts_other = agent_contexts[:agent_idx] + agent_contexts[agent_idx+1:]

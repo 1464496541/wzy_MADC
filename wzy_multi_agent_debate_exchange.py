@@ -47,14 +47,24 @@ from wzy_multi_agent_debate_expand import (
 # 从聚类模块导入核心函数、配置常量及答案处理工具函数
 from wzy_multi_agent_debate_clustering import (
     _reduce_dimensions_pca,
+    _reduce_dimensions_umap,
     _cluster_kmeans,
     _cluster_dbscan,
+    _cluster_hdbscan,
     _label_clusters_by_majority,
+    _diagnose_cluster_overmerge,
     _apply_cluster_labels_to_steps,
     MAJORITY_THRESHOLD,
     TARGET_DIM,
     DBSCAN_EPS,
     DBSCAN_MIN_SAMPLES,
+    HDBSCAN_MIN_CLUSTER_SIZE,
+    HDBSCAN_MIN_SAMPLES,
+    HDBSCAN_METRIC,
+    KMEANS_K_FIXED_PCA,
+    KMEANS_K_FIXED_UMAP,
+    UMAP_N_COMPONENTS,
+    UMAP_POST_L2,
     extract_answer_from_text,
     is_correct_answer,
     get_majority_answer_from_latest,
@@ -63,6 +73,27 @@ from wzy_multi_agent_debate_clustering import (
 
 # 并发配置
 EXCHANGE_CONCURRENT_LIMIT = 5  # exchange 阶段每批并发的 agent 数量上限
+
+# 默认降维方法："pca" | "umap"
+# 对外函数都会接收 reduction_method 形参，调用方未传时使用此默认值
+DEFAULT_REDUCTION_METHOD = "pca"
+
+
+def _resolve_kmeans_k(reduction_method: str) -> int:
+    """根据降维方法选择 KMeans 的 k：
+    - pca  → KMEANS_K_FIXED_PCA（线性投影下经验值，保留全局结构）
+    - umap → KMEANS_K_FIXED_UMAP（UMAP 已揭示自然簇结构，k 应当与之匹配）
+    """
+    if reduction_method == "umap":
+        return KMEANS_K_FIXED_UMAP
+    return KMEANS_K_FIXED_PCA
+
+
+def _resolve_target_dim(reduction_method: str) -> int:
+    """根据降维方法选择目标维度。当前两种方法甜点都是 10，但保留分化口子。"""
+    if reduction_method == "umap":
+        return UMAP_N_COMPONENTS
+    return TARGET_DIM
 
 
 # ============================================================
@@ -547,11 +578,15 @@ async def run_exchange1_from_expand_outputs(
     *,
     use_method: str = "kmeans",
     round_num: int = 1,
+    reduction_method: str = DEFAULT_REDUCTION_METHOD,
 ) -> dict:
     """
     在已完成 expand 且已得到向量与 all_steps 的前提下，执行单轮 exchange1：
-    PCA + 聚类 → 类簇标签 → 修正 step 标签 → 排序 → 构造 exchange prompt → API。
+    降维 + 聚类 → 类簇标签 → 修正 step 标签 → 排序 → 构造 exchange prompt → API。
     会原地修改 agent_contexts（追加 user + assistant）。
+
+    Args:
+        reduction_method: "pca" | "umap"
 
     Returns:
         {"majority_answer": str | None, "agent_contexts": list}
@@ -564,6 +599,7 @@ async def run_exchange1_from_expand_outputs(
         round_num,
         use_method,
         bidirectional=False,
+        reduction_method=reduction_method,
     )
     maj = _print_exchange_round_results(agent_contexts, round_num)
     return {"majority_answer": maj, "agent_contexts": agent_contexts}
@@ -575,12 +611,16 @@ async def run_exchange2_from_exchange1_outputs(
     *,
     use_method: str = "kmeans",
     round_num: int = 2,
+    reduction_method: str = DEFAULT_REDUCTION_METHOD,
 ) -> dict:
     """
     在 exchange1 已完成（agent_contexts 已含最新 assistant）的前提下执行 exchange2：
     从各 agent 最后一条 assistant 提取 step，按多数票继承 is_correct，向量化后执行
-    与 exchange1 相同的 PCA/聚类/修正/排序/Exchange API 流程。
+    与 exchange1 相同的 降维/聚类/修正/排序/Exchange API 流程。
     会原地修改 agent_contexts（再追加一轮 user + assistant）。
+
+    Args:
+        reduction_method: "pca" | "umap"
 
     Returns:
         {"majority_answer": str | None, "agent_contexts": list}
@@ -608,6 +648,7 @@ async def run_exchange2_from_exchange1_outputs(
         round_num,
         use_method,
         bidirectional=False,
+        reduction_method=reduction_method,
     )
     maj = _print_exchange_round_results(agent_contexts, round_num)
     return {"majority_answer": maj, "agent_contexts": agent_contexts}
@@ -621,10 +662,14 @@ async def run_exchange_bidirectional_1_from_expand_outputs(
     *,
     use_method: str = "kmeans",
     round_num: int = 1,
+    reduction_method: str = DEFAULT_REDUCTION_METHOD,
 ) -> dict:
     """
     与 run_exchange1_from_expand_outputs 相同数据流，但 Step 4 使用双向标签修正
     （correct 类簇全 True，wrong 类簇全 False）。
+
+    Args:
+        reduction_method: "pca" | "umap"
     """
     await _run_single_cluster_exchange_round(
         step_vectors,
@@ -634,6 +679,7 @@ async def run_exchange_bidirectional_1_from_expand_outputs(
         round_num,
         use_method,
         bidirectional=True,
+        reduction_method=reduction_method,
     )
     maj = _print_exchange_round_results(agent_contexts, round_num)
     return {"majority_answer": maj, "agent_contexts": agent_contexts}
@@ -645,10 +691,14 @@ async def run_exchange_bidirectional_2_from_bidirectional_1_outputs(
     *,
     use_method: str = "kmeans",
     round_num: int = 2,
+    reduction_method: str = DEFAULT_REDUCTION_METHOD,
 ) -> dict:
     """
     与 run_exchange2_from_exchange1_outputs 相同，但在 bidirectional_1 之后执行，
     聚类后 Step 4 为双向标签修正。
+
+    Args:
+        reduction_method: "pca" | "umap"
     """
     majority_answer, agent_results = expand_compute_majority_and_agent_results_from_latest(
         agent_contexts, cfg
@@ -675,6 +725,7 @@ async def run_exchange_bidirectional_2_from_bidirectional_1_outputs(
         round_num,
         use_method,
         bidirectional=True,
+        reduction_method=reduction_method,
     )
     maj = _print_exchange_round_results(agent_contexts, round_num)
     return {"majority_answer": maj, "agent_contexts": agent_contexts}
@@ -713,9 +764,10 @@ async def _run_single_cluster_exchange_round(
     use_method: str = "kmeans",
     *,
     bidirectional: bool = False,
+    reduction_method: str = DEFAULT_REDUCTION_METHOD,
 ) -> None:
     """
-    执行单轮「聚类 → 排序 → 构建 prompt → exchange」流程。
+    执行单轮「降维 → 聚类 → 排序 → 构建 prompt → exchange」流程。
 
     agent_contexts 被原地追加（每个 agent 追加 user + assistant 两条消息），
     调用方通过读取 agent_contexts 获取本轮结果，无需返回值。
@@ -726,8 +778,12 @@ async def _run_single_cluster_exchange_round(
         all_steps: 含 is_correct 标签的 step 列表
         agent_contexts: 所有 agent 的对话上下文（原地追加）
         round_num: 当前轮次编号（仅用于日志标注）
-        use_method: "kmeans" 或 "dbscan"
+        use_method: 聚类方法："kmeans" | "dbscan" | "hdbscan"
         bidirectional: True 时 correct 类簇全置 True、wrong 类簇全置 False；False 时仅 correct 类簇置 True
+        reduction_method: 降维方法："pca" | "umap"
+            - pca  → 先 L2 → PCA → 再 L2（线性投影 + 单位球面，配 KMeans 较稳）
+            - umap → UMAP（cosine metric 内置标度无关，前后默认不做 L2，保留 manifold）
+            KMeans 时 k 按降维方法自适应（pca→7, umap→4）
     """
     tag = (
         f"Bidirectional Exchange Round {round_num}"
@@ -736,17 +792,32 @@ async def _run_single_cluster_exchange_round(
     )
 
     # ══════════════════════════════════════════════════════════
-    # Step 1: PCA 降维 + L2 归一化
+    # Step 1: 降维（PCA + L2 / UMAP）
     # ══════════════════════════════════════════════════════════
+    if reduction_method == "umap":
+        step1_title = "UMAP 降维"
+    else:
+        step1_title = "PCA 降维 + L2 归一化"
     print(f"\n{'═'*80}")
-    print(f"  [{tag} - Step 1] PCA 降维 + L2 归一化")
+    print(f"  [{tag} - Step 1] {step1_title}")
     print(f"{'═'*80}")
     print(f"    输入向量: {step_vectors.shape[0]} 个, {step_vectors.shape[1]} 维")
-    print(f"    目标维度: {TARGET_DIM}")
-    vectors_reduced = _reduce_dimensions_pca(step_vectors, target_dim=TARGET_DIM)
-    norms = np.linalg.norm(vectors_reduced, axis=1, keepdims=True)
-    vectors_reduced = vectors_reduced / (norms + 1e-12)
-    print(f"    L2 归一化完成")
+    target_dim_eff = _resolve_target_dim(reduction_method)
+    print(f"    目标维度: {target_dim_eff}（reduction_method={reduction_method}）")
+
+    if reduction_method == "umap":
+        vectors_reduced = _reduce_dimensions_umap(step_vectors, target_dim=target_dim_eff)
+        if UMAP_POST_L2:
+            norms = np.linalg.norm(vectors_reduced, axis=1, keepdims=True)
+            vectors_reduced = vectors_reduced / (norms + 1e-12)
+            print(f"    UMAP 后 L2 归一化完成（UMAP_POST_L2=True）")
+        else:
+            print(f"    UMAP 后不做 L2（保留 UMAP manifold 几何，UMAP_POST_L2=False）")
+    else:
+        vectors_reduced = _reduce_dimensions_pca(step_vectors, target_dim=target_dim_eff)
+        norms = np.linalg.norm(vectors_reduced, axis=1, keepdims=True)
+        vectors_reduced = vectors_reduced / (norms + 1e-12)
+        print(f"    PCA 后 L2 归一化完成")
     print(f"    输出向量: {vectors_reduced.shape[0]} 个, {vectors_reduced.shape[1]} 维")
     print(f"{'═'*80}")
 
@@ -761,8 +832,22 @@ async def _run_single_cluster_exchange_round(
         cluster_labels_raw = _cluster_dbscan(
             vectors_reduced, eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_SAMPLES
         )
+    elif use_method == "hdbscan":
+        print(
+            f"    参数: min_cluster_size={HDBSCAN_MIN_CLUSTER_SIZE}, "
+            f"min_samples={HDBSCAN_MIN_SAMPLES}, metric={HDBSCAN_METRIC}"
+        )
+        cluster_labels_raw = _cluster_hdbscan(
+            vectors_reduced,
+            min_cluster_size=HDBSCAN_MIN_CLUSTER_SIZE,
+            min_samples=HDBSCAN_MIN_SAMPLES,
+            metric=HDBSCAN_METRIC,
+        )
     else:
-        cluster_labels_raw = _cluster_kmeans(vectors_reduced)
+        # KMeans: k 按降维方法自适应（pca→7, umap→4）
+        kmeans_k = _resolve_kmeans_k(reduction_method)
+        print(f"    参数: n_clusters={kmeans_k}（reduction_method={reduction_method}）")
+        cluster_labels_raw = _cluster_kmeans(vectors_reduced, n_clusters=kmeans_k)
     print(f"{'═'*80}")
 
     # ══════════════════════════════════════════════════════════
@@ -807,6 +892,17 @@ async def _run_single_cluster_exchange_round(
         else:
             print(f"      包含: {', '.join(_step_labels[:20])}, ... (共 {len(_step_labels)} 个)")
     print(f"{'═'*80}")
+
+    # ══════════════════════════════════════════════════════════
+    # Step 3.5: 簇过度合并诊断（4 项指标，用于判断是否需调大 UMAP_MIN_DIST）
+    # ══════════════════════════════════════════════════════════
+    _diagnose_cluster_overmerge(
+        cluster_labels_raw,
+        cluster_tag_results,
+        step_indices,
+        all_steps,
+        method_name=f"{tag} - 过度合并诊断（reduction={reduction_method}, cluster={use_method}）",
+    )
 
     # ══════════════════════════════════════════════════════════
     # Step 4: 标签修正

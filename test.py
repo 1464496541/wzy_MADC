@@ -46,17 +46,17 @@ def _rel_display(base: Path, p: Path) -> str:
 
 
 # ---------- 可配置项（改这里即可）----------
-QUESTION_ID = 144
+QUESTION_ID = 486
 
 # 目录里只有一个 .json 时可填 None，会自动选用该文件；
 # 若有多个 .json，请填写完整文件名，例如:
 # "debate_qwen2.5-7b-instruct_10_3_expand_exchangeI41_exchangeI41_agent_com0_False.json"
 # D:\AAAI2026-MADC-main - test-one-question\qwen2.5-7b-instruct\results\debate_zy\math_500_id\debate_zy_qwen2.5-7b-instruct_10_1_expand_agent_com0_False.json
-DEBATE_JSON_FILE = "debate_zy_qwen2.5-7b-instruct_10_1_exchange1_agent_com0_False.json"
+DEBATE_JSON_FILE = "debate_zy_qwen2.5-7b-instruct_10_1_expand_agent_com0_False.json"
 
 # 结果 JSON 根目录。None 时：若 DEBATE_JSON_FILE 名以 debate_zy 开头则用 results/debate_zy，否则用 results/debate
 # 也可显式写: "qwen2.5-7b-instruct/results/debate_zy"
-DEBATE_DIR: str | Path | None = "qwen2.5-7b-instruct/results/debate_zy"
+DEBATE_DIR: str | Path | None = "qwen2.5-7b-instruct/results/debate_zy/math_500_id/pre_train"
 
 # 题库 JSON：填 None 则用「仓库根/qwen2.5-7b-instruct/data/math_500_id.json」
 MATH_ID_JSON: str | Path | None = None

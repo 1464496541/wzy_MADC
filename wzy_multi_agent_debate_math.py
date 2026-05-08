@@ -68,6 +68,7 @@ from wzy_multi_agent_debate_expand import (
     get_cache_path,
     is_correct_answer,
     run_expand_pipeline,
+    run_expand_pipeline_from_cache,
 )
 from wzy_multi_agent_debate_exchange import (
     run_exchange1_from_expand_outputs,
@@ -86,15 +87,30 @@ CONFIG = default_expand_config()
 #   亦可合并：bidirectional 使用 expand 快照，与 exchange1/2 互不污染 agent_contexts
 ACTION_PIPELINE: List[str] = ["expand", "exchange1", "exchange2","exchange_bidirectional_1", "exchange_bidirectional_2"]
 
-# exchange1 聚类方法："kmeans" | "dbscan"
-EXCHANGE1_CLUSTER_METHOD = "kmeans"
+# ---------- 降维 + 聚类配置 ----------
+# 推荐组合（两个开关独立，可任意组合）：
+#   1) REDUCTION_METHOD="pca",  EXCHANGE1_CLUSTER_METHOD="kmeans"   → 基线（原行为，KMeans k=7）
+#   2) REDUCTION_METHOD="umap", EXCHANGE1_CLUSTER_METHOD="hdbscan"  → 学术经典 UMAP+HDBSCAN（主推）
+#   3) REDUCTION_METHOD="umap", EXCHANGE1_CLUSTER_METHOD="kmeans"   → UMAP+KMeans 实验组（k 自动用 4）
+# 降维方法："pca" | "umap"
+REDUCTION_METHOD: str = "umap"
+# 聚类方法："kmeans" | "dbscan" | "hdbscan"
+EXCHANGE1_CLUSTER_METHOD = "hdbscan"
+
+# ---------- expand 缓存快速通道 ----------
+# True（推荐）：执行 expand 前先尝试整题加载缓存的 agent_contexts；
+#               命中 → 跳过推理 API；未命中 → 打印提示并正常调 API。
+#               仍会调用 embedding API 重建向量（embedding 已有 hash 缓存，几乎零成本）。
+# False：跳过快速通道，每题都直接走完整 expand_run_pipeline（用于强制重新生成回复）。
+EXPAND_USE_CACHE: bool = True
 
 # ---------- 批量配置 ----------
 # True：按 BATCH_QUESTION_IDS / BATCH_MAX_QUESTIONS 从数据集取多题依次跑
 # False：单题（沿用 CONFIG.fixed_question_id 为 None 时随机一题，否则固定 id）
 RUN_BATCH: bool = True
 # 非 None 时只跑这些 question_id（与数据集中类型一致即可，内部转 str 匹配）
-BATCH_QUESTION_IDS: Optional[List[Any]] = [18,37,124,146,214,247,235,286,352,392,395,460,467,495]
+BATCH_QUESTION_IDS: Optional[List[Any]] = [342]
+# BATCH_QUESTION_IDS: Optional[List[Any]] = None
 # 全表模式下最多跑多少题（None 表示不截断）；在 BATCH_QUESTION_IDS 为 None 时生效
 BATCH_MAX_QUESTIONS: Optional[int] = None
 
@@ -102,6 +118,9 @@ BATCH_MAX_QUESTIONS: Optional[int] = None
 # 0 = 静默（仅关键摘要 + 累计正确率），1 = 全量日志（调试单题）
 # 批量时建议 0；单题调试时设 1
 BATCH_VERBOSE: int = 1
+
+# True：即使 BATCH_VERBOSE=0，仍在进入 exchange2 前打印 agent_contexts 摘要（便于批量时核对）
+PRINT_DEBUG_AGENT_CONTEXTS_BEFORE_EXCHANGE2: bool = False
 
 
 @contextlib.contextmanager
@@ -119,6 +138,42 @@ def _suppress_stdout():
 def _quiet() -> bool:
     """当前是否处于静默模式。"""
     return BATCH_VERBOSE < 1
+
+
+def _print_agent_contexts_before_exchange2(
+    agent_contexts: List[Any],
+    question_id: Any,
+    *,
+    max_preview_chars: int = 160,
+) -> None:
+    """进入 exchange2 前打印各 agent 对话结构，便于确认已含 exchange1 追加的 user + assistant。
+
+    正常时：expand 后 3 条（system → user → assistant）；exchange1 后再 +2 条（user → assistant），
+    共至少 5 条；角色链末尾应为 ``... assistant -> user -> assistant``。
+    """
+    print("\n" + "─" * 72)
+    print(
+        f"[调试·exchange2 入口] question_id={question_id}\n"
+        f"  说明：expand_pack 中 agent_contexts 与 exchange1 共用同一可变列表，"
+        f"此处应为 **已追加 exchange1** 后的内容。"
+    )
+    print("─" * 72)
+    for aidx, ctx in enumerate(agent_contexts):
+        if not ctx:
+            print(f"\n  Agent {aidx}: （空列表）")
+            continue
+        roles = " → ".join(str(m.get("role", "?")) for m in ctx)
+        n_msg = len(ctx)
+        print(f"\n  ┌─ Agent {aidx}  消息数={n_msg}  角色链: {roles}")
+        for mi, msg in enumerate(ctx):
+            role = msg.get("role", "?")
+            raw = msg.get("content") or ""
+            vis = raw.replace("\n", " ↵ ")
+            if len(vis) > max_preview_chars:
+                vis = vis[:max_preview_chars] + f" …（共 {len(raw)} 字符，已截断）"
+            print(f"  │  [{mi:>2}] {role:<12} {vis!r}")
+        print(f"  └{'─' * 66}")
+    print("─" * 72 + "\n")
 
 
 _STAGES = (
@@ -245,8 +300,51 @@ async def run_question_pipeline(
                 print("# 动作: expand")
                 print("#" * 72)
 
-            if _quiet():
-                with _suppress_stdout():
+            expand_pack = None
+
+            # 1) 缓存优先：开启时先尝试整题加载，命中则跳过推理 API
+            if EXPAND_USE_CACHE:
+                if _quiet():
+                    with _suppress_stdout():
+                        expand_pack = await run_expand_pipeline_from_cache(
+                            cfg=CONFIG,
+                            question_item=question_item,
+                        )
+                else:
+                    expand_pack = await run_expand_pipeline_from_cache(
+                        cfg=CONFIG,
+                        question_item=question_item,
+                    )
+                if expand_pack is None:
+                    miss_qid = (
+                        str(question_item.get("question_id", "?"))
+                        if question_item is not None
+                        else (
+                            str(CONFIG.fixed_question_id)
+                            if CONFIG.fixed_question_id is not None
+                            else "?"
+                        )
+                    )
+                    print(
+                        f"[expand 缓存] 未命中：question_id={miss_qid}（缓存缺失或不完整），"
+                        f"将正常调用推理 API"
+                    )
+                elif not _quiet():
+                    print(f"[expand 缓存] 命中后直接进入下游 exchange，跳过推理 API 调用")
+
+            # 2) 缓存未命中（或 EXPAND_USE_CACHE=False）→ 走完整 expand pipeline 调 API
+            if expand_pack is None:
+                if _quiet():
+                    with _suppress_stdout():
+                        expand_pack = await run_expand_pipeline(
+                            cfg=CONFIG,
+                            question_item=question_item,
+                            save_cache=True,
+                            return_vectorization_data=True,
+                            verify_vectorization=VERIFY_VECTORIZATION,
+                            save_debug_files=SAVE_DEBUG_FILES,
+                        )
+                else:
                     expand_pack = await run_expand_pipeline(
                         cfg=CONFIG,
                         question_item=question_item,
@@ -255,15 +353,6 @@ async def run_question_pipeline(
                         verify_vectorization=VERIFY_VECTORIZATION,
                         save_debug_files=SAVE_DEBUG_FILES,
                     )
-            else:
-                expand_pack = await run_expand_pipeline(
-                    cfg=CONFIG,
-                    question_item=question_item,
-                    save_cache=True,
-                    return_vectorization_data=True,
-                    verify_vectorization=VERIFY_VECTORIZATION,
-                    save_debug_files=SAVE_DEBUG_FILES,
-                )
 
             if expand_pack is None:
                 print("[错误] expand 未返回数据，本题后续动作跳过")
@@ -327,6 +416,7 @@ async def run_question_pipeline(
                         agent_contexts,
                         use_method=EXCHANGE1_CLUSTER_METHOD,
                         round_num=1,
+                        reduction_method=REDUCTION_METHOD,
                     )
             else:
                 out = await run_exchange1_from_expand_outputs(
@@ -336,6 +426,7 @@ async def run_question_pipeline(
                     agent_contexts,
                     use_method=EXCHANGE1_CLUSTER_METHOD,
                     round_num=1,
+                    reduction_method=REDUCTION_METHOD,
                 )
             exchange1_maj = out.get("majority_answer")
             match_gt = (
@@ -386,6 +477,9 @@ async def run_question_pipeline(
                 return summary
             _sv2, _si2, _st2, agent_contexts, _, ground_truth, question, question_id = expand_pack
 
+            if not _quiet() or PRINT_DEBUG_AGENT_CONTEXTS_BEFORE_EXCHANGE2:
+                _print_agent_contexts_before_exchange2(agent_contexts, question_id)
+
             if not _quiet():
                 print("\n" + "#" * 72)
                 print("# 动作: exchange2（基于 exchange1 最新回复重建向量 + 聚类 exchange）")
@@ -398,6 +492,7 @@ async def run_question_pipeline(
                         CONFIG,
                         use_method=EXCHANGE1_CLUSTER_METHOD,
                         round_num=2,
+                        reduction_method=REDUCTION_METHOD,
                     )
             else:
                 out2 = await run_exchange2_from_exchange1_outputs(
@@ -405,6 +500,7 @@ async def run_question_pipeline(
                     CONFIG,
                     use_method=EXCHANGE1_CLUSTER_METHOD,
                     round_num=2,
+                    reduction_method=REDUCTION_METHOD,
                 )
             exchange2_maj = out2.get("majority_answer")
             match_gt = (
@@ -473,6 +569,7 @@ async def run_question_pipeline(
                         agent_contexts,
                         use_method=EXCHANGE1_CLUSTER_METHOD,
                         round_num=1,
+                        reduction_method=REDUCTION_METHOD,
                     )
             else:
                 out_bd1 = await run_exchange_bidirectional_1_from_expand_outputs(
@@ -482,6 +579,7 @@ async def run_question_pipeline(
                     agent_contexts,
                     use_method=EXCHANGE1_CLUSTER_METHOD,
                     round_num=1,
+                    reduction_method=REDUCTION_METHOD,
                 )
             bd1_maj = out_bd1.get("majority_answer")
             match_gt = (
@@ -544,6 +642,7 @@ async def run_question_pipeline(
                         CONFIG,
                         use_method=EXCHANGE1_CLUSTER_METHOD,
                         round_num=2,
+                        reduction_method=REDUCTION_METHOD,
                     )
             else:
                 out_bd2 = await run_exchange_bidirectional_2_from_bidirectional_1_outputs(
@@ -551,6 +650,7 @@ async def run_question_pipeline(
                     CONFIG,
                     use_method=EXCHANGE1_CLUSTER_METHOD,
                     round_num=2,
+                    reduction_method=REDUCTION_METHOD,
                 )
             bd2_maj = out_bd2.get("majority_answer")
             match_gt = (

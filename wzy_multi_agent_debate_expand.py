@@ -95,6 +95,9 @@ IS_MATH = True
 
 API_URL = "https://api.zhizengzeng.com/v1"
 API_KEY = "sk-zk2825bae2adf40f5eb42183b44b3e0630e69c2098d7527d"
+# glm-4-flashx
+# MODEL_NAME = "glm-4-flashx"
+# MODEL_TAG = "glm-4-flashx"
 MODEL_NAME = "qwen2.5-7b-instruct"
 MODEL_TAG = "qwen2.5-7b-instruct"
 
@@ -177,7 +180,7 @@ def extract_answer_from_text(text: str, is_math: bool = False):
     is_math=True 三级提取链：
       1. parse_math_anser       → \\boxed{...}（最显式）
       2. parse_answer_fallback  → "The answer is: ..."（模型明确陈述答案）
-      3. solve_math_problems    → 括号整数 (-?\\d+)（纯格式猜测，兜底）
+      3. solve_math_problems    → 括号整数 (-?\\d+)（兜底方法）
     is_math=False：parse_answer → solve_math_problems → parse_YN
     """
     if not text:
@@ -220,7 +223,7 @@ def get_majority_answer_from_expand(agent_contexts: list, is_math: bool = False)
 
 
 def is_correct_answer(pred, ref: str, is_math: bool = False) -> bool:
-    """判断预测答案是否与标准答案一致。
+    """判断预测答案是否与多数投票答案一致。
     逻辑完全参照 compute_accuracy 中的比较方式：
       - is_math=True : strip_string(ref) == pred  （pred 已经 strip_string 过）
       - is_math=False: ref == pred
@@ -234,10 +237,21 @@ def is_correct_answer(pred, ref: str, is_math: bool = False) -> bool:
 
 
 def extract_steps_from_response(response: str) -> list:
-    """从模型回复中提取 'Step X' 格式的推理步骤列表"""
+    """从模型回复中解析出「分步推理」列表。
+
+    期望模型按 ``Step 1``、``Step 2`` … 书写；用 ``"Step "`` 切分后逐段解析编号与正文。
+    返回 ``list[dict]``，每项形如 ``{"step_number": int, "content": str}``，供后续
+    ``expand_flatten_all_steps``、聚类/向量化等使用。
+
+    行为要点：
+    - 含 ``Step `` 时：每段尽量用正则抽出 ``Step N:`` / ``Step N.`` 后的内容；否则顺延编号。
+    - 全文无任何 ``Step `` 时：整段回复视为单一步骤 ``step_number=1``（兜底）。
+    """
     steps = []
     if not response:
         return steps
+
+    # 按字面 "Step " 切开：第一段是 Step 1 之前的前缀（常为空或开场白），从第二段起才是各步正文
     raw_steps = response.split("Step ")[1:]
     for raw in raw_steps:
         # 匹配 "Step 1: ..." 或 "Step 1. ..." 格式
@@ -253,6 +267,7 @@ def extract_steps_from_response(response: str) -> list:
             "step_number": step_num,
             "content": content,
         })
+
     # 兜底：若回复中不含任何 "Step " 关键字，将整个回复作为一个步骤保存
     if not steps and response.strip():
         steps.append({
@@ -843,6 +858,11 @@ def expand_run_embedding(
     all_steps: List[Dict[str, Any]],
     cfg: ExpandConfig,
 ) -> Tuple[Optional[np.ndarray], Optional[List[int]]]:
+    """对展平后的 step 列表做 Embedding API 向量化。
+
+    每道题内各 agent 的 step 均针对同一题干，故仅对 step 正文向量化，不拼接题干前缀，
+    以降低 token 与缓存 key 歧义（缓存键仅依赖 step 文本本身）。
+    """
     print(f"\n{'═'*80}")
     print("  [Expand Step 7] 步骤向量化 (Embedding)")
     print(f"{'═'*80}")
@@ -861,6 +881,7 @@ def expand_run_embedding(
                 reduce_dim=False,
                 batch_size=20,
             )
+            print("\n[向量化] 仅使用各 step 的 content 文本（不注入题干前缀）")
             step_vectors, step_indices = refiner.vectorize_steps(all_steps)
             if step_vectors is not None and step_vectors.shape[0] > 0:
                 print(
@@ -878,6 +899,127 @@ def expand_run_embedding(
     print(f"{'═'*80}")
     return step_vectors, step_indices
 
+
+
+def try_load_full_expand_cache(
+    cfg: ExpandConfig,
+    question_id: str,
+    question: Optional[str] = None,
+) -> Optional[List[List[Dict[str, Any]]]]:
+    """
+    尝试一次性整题加载 expand 阶段的 agent_contexts 缓存。
+
+    与 expand_run_inference 中"逐 agent 命中"的细粒度逻辑不同，本函数从整题视角检查：
+    缓存文件是否存在 → 是否含本题记录 → agent 数量与每个 agent 的 assistant 回复是否
+    都齐备。任一条件不满足即返回 None，让上层退回完整 expand 流程。
+
+    Args:
+        cfg: ExpandConfig 实例
+        question_id: 题目 id（字符串）
+        question: 题干文本（用于按 question 作 key 的旧格式缓存兼容）
+
+    Returns:
+        命中：返回 agent_contexts（每个 ctx 至少 system/user/assistant 三条消息）；
+        未命中：返回 None。
+    """
+    cache_path = expand_get_cache_path(cfg)
+    if not os.path.exists(cache_path):
+        return None
+
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            cached_blob = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"  [快速通道][缓存读取失败] {e}")
+        return None
+
+    entry = get_expand_cache_entry(cached_blob, question_id, question)
+    if entry is None:
+        return None
+
+    agent_contexts = entry[0]
+    if not isinstance(agent_contexts, list):
+        return None
+
+    if len(agent_contexts) != cfg.num_agents:
+        print(
+            f"  [快速通道][校验失败] 缓存中 agent 数 {len(agent_contexts)} != "
+            f"配置 num_agents={cfg.num_agents}"
+        )
+        return None
+
+    for aidx, ctx in enumerate(agent_contexts):
+        if not isinstance(ctx, list) or len(ctx) < 3:
+            print(f"  [快速通道][校验失败] Agent {aidx} 上下文消息数 < 3")
+            return None
+        if ctx[2].get("role") != "assistant":
+            print(f"  [快速通道][校验失败] Agent {aidx} 的 ctx[2] 非 assistant")
+            return None
+        if not (ctx[2].get("content") or "").strip():
+            print(f"  [快速通道][校验失败] Agent {aidx} 的 assistant 回复为空")
+            return None
+
+    return agent_contexts
+
+
+async def run_expand_pipeline_from_cache(
+    cfg: ExpandConfig,
+    question_item: Optional[dict] = None,
+) -> Optional[Tuple]:
+    """expand 阶段「缓存快速通道」：仅依赖磁盘缓存重建 expand_pack，不调用任何模型 API。
+
+    流程：
+      1. 加载题目（若 question_item 为 None 则按 cfg.fixed_question_id 选）
+      2. 调 try_load_full_expand_cache 整题查找缓存 agent_contexts；
+         - 未命中或不完整 → 返回 None，由上层决定是否退回完整 pipeline
+         - 命中 → 在缓存基础上跑后续无 API 的"轻量"流程（多数票/step 切分/向量化）
+      3. 复用 expand_compute_majority_and_agent_results / expand_flatten_all_steps /
+         expand_run_embedding（embedding 已有 hash 缓存，几乎零成本）
+
+    Returns:
+        命中：与 run_expand_pipeline(return_vectorization_data=True) 完全相同的 8 元组：
+              (step_vectors, step_indices, all_steps, agent_contexts,
+               majority_answer, ground_truth, question, question_id)
+        未命中或题目加载失败：None
+    """
+    loaded = expand_load_question(cfg, question_item)
+    if loaded is None:
+        return None
+    question, ground_truth, question_id = loaded
+
+    agent_contexts = try_load_full_expand_cache(cfg, question_id, question)
+    if agent_contexts is None:
+        return None
+
+    print(
+        f"\n[expand 快速通道] 缓存命中：question_id={question_id}，已加载 "
+        f"{len(agent_contexts)} 个 agent_contexts，跳过推理 API"
+    )
+
+    expand_print_question_header(question, ground_truth, question_id)
+    expand_print_step2_responses(agent_contexts)
+
+    majority_answer, agent_results = expand_compute_majority_and_agent_results(
+        agent_contexts, cfg
+    )
+    expand_print_step3_majority(agent_contexts, cfg, majority_answer)
+    expand_print_step4_agent_vs_majority(agent_results, majority_answer, cfg.num_agents)
+    expand_print_step5_steps(agent_results)
+
+    all_steps = expand_flatten_all_steps(agent_results)
+    expand_print_step6_all_steps(all_steps, cfg.num_agents)
+    step_vectors, step_indices = expand_run_embedding(all_steps, cfg)
+
+    return (
+        step_vectors,
+        step_indices,
+        all_steps,
+        agent_contexts,
+        majority_answer,
+        ground_truth,
+        question,
+        question_id,
+    )
 
 
 async def run_expand_pipeline(
@@ -904,6 +1046,19 @@ async def run_expand_pipeline(
     expand_print_question_header(question, ground_truth, question_id)
     fewshot_content, agent_contexts = expand_build_agent_contexts(question, cfg)
 
+    if agent_contexts:
+        sample_idx = 0
+        sample_context = agent_contexts[sample_idx]
+        print("=" * 80)
+        print(f"[agent_contexts 示例] 共 {len(agent_contexts)} 个 agent，展示 agent[{sample_idx}]：")
+        print("-" * 80)
+        for msg_idx, message in enumerate(sample_context):
+            role = message.get("role", "")
+            content = message.get("content", "")
+            print(f"--- message[{msg_idx}] | role: {role} ---")
+            print(content)
+            print()
+        print("=" * 80)
     cache_path = expand_get_cache_path(cfg)
     await expand_run_inference(agent_contexts, question, cache_path, cfg, save_cache, question_id)
     expand_print_step2_responses(agent_contexts)
