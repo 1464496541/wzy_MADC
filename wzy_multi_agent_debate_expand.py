@@ -97,9 +97,15 @@ API_URL = "https://api.zhizengzeng.com/v1"
 API_KEY = "sk-zk2177a2c734fd960f54241b24e15e59412692a93b02905b"
 # glm-4-flashx
 # MODEL_NAME = "glm-4-flashx"
+<<<<<<< HEAD
 # MODEL_TAG = ""
 MODEL_NAME = "glm-4-flashx"
 MODEL_TAG = "glm-4-flashx"
+=======
+# MODEL_TAG = "glm-4-flashx"
+MODEL_NAME = "qwen-turbo"
+MODEL_TAG = "qwen-turbo"
+>>>>>>> 8f7ba01483c2d54ea14571884a8e68c756a0a0c5
 
 client = OpenAI(base_url=API_URL, api_key=API_KEY)
 async_client = AsyncOpenAI(base_url=API_URL, api_key=API_KEY)
@@ -144,31 +150,39 @@ def construct_assistant_message(completion):
     return {"role": "assistant", "content": content}
 
 
-def generate_answer(answer_context):
+MAX_RETRIES = 5
+
+def generate_answer(answer_context, retry_count: int = 0):
     try:
         response = client.chat.completions.create(
             model=MODEL_TAG, messages=answer_context, max_tokens=4096, n=1
         )
         completion = json.loads(response.json())
     except Exception as e:
-        print("retrying due to an error......")
-        print(e)
+        if retry_count >= MAX_RETRIES:
+            print(f"[错误] API 调用失败已达最大重试次数 ({MAX_RETRIES})，放弃重试")
+            print(f"       最后错误: {e}")
+            raise
+        print(f"[重试] API 调用失败 (尝试 {retry_count + 1}/{MAX_RETRIES}): {e}")
         time.sleep(20)
-        return generate_answer(answer_context)
+        return generate_answer(answer_context, retry_count + 1)
     return completion
 
 
-async def agenerate_answer(answer_context):
+async def agenerate_answer(answer_context, retry_count: int = 0):
     try:
         response = await async_client.chat.completions.create(
             model=MODEL_TAG, messages=answer_context, max_tokens=4096, n=1
         )
         completion = json.loads(response.json())
     except Exception as e:
-        print("retrying due to an error......")
-        print(e)
+        if retry_count >= MAX_RETRIES:
+            print(f"[错误] API 调用失败已达最大重试次数 ({MAX_RETRIES})，放弃重试")
+            print(f"       最后错误: {e}")
+            raise
+        print(f"[重试] API 调用失败 (尝试 {retry_count + 1}/{MAX_RETRIES}): {e}")
         time.sleep(20)
-        return generate_answer(answer_context)
+        return generate_answer(answer_context, retry_count + 1)
     return completion
 
 
@@ -819,7 +833,9 @@ def expand_print_step5_steps(agent_results: List[Dict[str, Any]]) -> None:
         else:
             _raw = _safe_str(ar["raw_response"], max_len=200)
             print(f"  \u2502  (未提取到结构化步骤, 原始回复预览: {_raw})")
-        print(f"  \u2514{'\u2500'*70}")
+        _corner = "\u2514"
+        _h = "\u2500"
+        print(f"  {_corner}{_h * 70}")
     print(f"{'═'*80}")
 
 

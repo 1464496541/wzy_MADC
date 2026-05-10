@@ -122,6 +122,46 @@ BATCH_VERBOSE: int = 0
 # True：即使 BATCH_VERBOSE=0，仍在进入 exchange2 前打印 agent_contexts 摘要（便于批量时核对）
 PRINT_DEBUG_AGENT_CONTEXTS_BEFORE_EXCHANGE2: bool = False
 
+# ---------- 断点续跑配置 ----------
+# True：启用断点续跑，从 checkpoint.json 读取已完成题目并跳过
+# False：不启用，每次全量运行
+ENABLE_CHECKPOINT: bool = True
+
+import os as _os
+
+class CheckpointManager:
+    """管理断点续跑的 checkpoint 文件读写。"""
+
+    def __init__(self, checkpoint_path: str):
+        self.path = checkpoint_path
+        self.data: Dict[str, bool] = self._load()
+
+    def _load(self) -> Dict[str, bool]:
+        if _os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                return {}
+        return {}
+
+    def save(self) -> None:
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=2)
+
+    def is_completed(self, question_id: str) -> bool:
+        return bool(self.data.get(str(question_id), False))
+
+    def mark_completed(self, question_id: str) -> None:
+        qid = str(question_id)
+        if not self.data.get(qid):
+            self.data[qid] = True
+            self.save()
+            print(f"[断点续跑] question_id={qid} 已完成，已记录")
+
+    def get_completed_count(self) -> int:
+        return sum(1 for v in self.data.values() if v)
+
 
 @contextlib.contextmanager
 def _suppress_stdout():
@@ -269,6 +309,7 @@ def load_batch_question_items(cfg: Any) -> List[Dict[str, Any]]:
 async def run_question_pipeline(
     question_item: Optional[Dict[str, Any]],
     stats: Dict[str, Dict[str, Any]],
+    checkpoint: Optional["CheckpointManager"] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     对单道题执行 ACTION_PIPELINE；更新 stats中各阶段 attempted/correct，并打印本题摘要与累计正确率。
@@ -701,6 +742,11 @@ async def run_question_pipeline(
         print("\n" + "=" * 72)
         print("[本题流水线结束]", summary)
         print("=" * 72)
+
+    if checkpoint is not None and question_item is not None:
+        qid = str(question_item.get("question_id", "?"))
+        checkpoint.mark_completed(qid)
+
     return summary
 
 
@@ -713,12 +759,28 @@ async def main_math() -> Optional[Dict[str, Any]]:
         if not items:
             print("[错误] 批量列表为空，请检查 BATCH_QUESTION_IDS / 数据路径 / is_hard 过滤")
             return None
+
+        checkpoint: Optional[CheckpointManager] = None
+        if ENABLE_CHECKPOINT:
+            ck_path = f"{CONFIG.model_name}/checkpoint.json"
+            checkpoint = CheckpointManager(ck_path)
+            total_raw = len(items)
+            items = [item for item in items
+                     if not checkpoint.is_completed(str(item.get("question_id", "?")))]
+            skipped = total_raw - len(items)
+            print(f"\n[断点续跑] 已完成 {checkpoint.get_completed_count()} 题 / 总共 {total_raw} 题")
+            print(f"[断点续跑] 本次将跳过 {skipped} 题，待运行 {len(items)} 题")
+
+        if not items:
+            print("[断点续跑] 所有题目已完成，无需运行")
+            return None
+
         print(f"\n[批量] 共 {len(items)} 道题，ACTION_PIPELINE={ACTION_PIPELINE}")
         summaries: List[Optional[Dict[str, Any]]] = []
         for idx, item in enumerate(items):
             qid = item.get("question_id", "?")
             print(f"\n{'#' * 72}\n# 批量进度 {idx + 1}/{len(items)}  question_id={qid}\n{'#' * 72}")
-            summ = await run_question_pipeline(item, stats)
+            summ = await run_question_pipeline(item, stats, checkpoint=checkpoint)
             summaries.append(summ)
         _print_batch_summary(stats)
         return {
