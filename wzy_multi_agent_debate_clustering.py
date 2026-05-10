@@ -4,7 +4,7 @@ Step 聚类脚本
 功能：
 1. 调用 wzy_multi_agent_debate_expand 获取向量化后的 step 数据
 2. 对高维向量进行 PCA 降维（4096 -> 128 维）
-3. 分别使用 KMeans 和 DBSCAN 进行聚类（KMeans 的 k 固定为 7）
+3. 分别使用 KMeans 和 HDBSCAN 进行聚类（KMeans 的 k 由 HDBSCAN 自动探测确定）
 4. 根据每个聚类中正确 step 的比例（majority_threshold=0.6）对类簇打标签：
    - correct_ratio >= 0.6 -> 该类簇标记为正确
    - wrong_ratio >= 0.6 -> 该类簇标记为错误
@@ -43,8 +43,8 @@ from eval_all_round import (
 try:
     from sklearn.preprocessing import StandardScaler
     from sklearn.decomposition import PCA
-    from sklearn.cluster import KMeans, DBSCAN
-    from sklearn.metrics import silhouette_score
+    from sklearn.cluster import KMeans  # [已注释] DBSCAN 已移除
+    # from sklearn.metrics import silhouette_score  # [已注释] 轮廓系数已移除
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
@@ -66,6 +66,8 @@ except ImportError:
 # UMAP 后端：可选依赖；未安装时调用降维会抛 ImportError
 try:
     import umap  # type: ignore
+    import warnings
+    warnings.filterwarnings("ignore", message="n_jobs value .* overridden.*random_state")
     UMAP_AVAILABLE = True
 except ImportError:
     UMAP_AVAILABLE = False
@@ -73,16 +75,18 @@ except ImportError:
 # 配置
 MAJORITY_THRESHOLD = 0.6   # 聚类中多数投票的阈值：正确/错误占比 >= 60% 时生效
 TARGET_DIM = 10            # PCA 降维目标维度（针对 LLM 句向量聚类的甜点：5~15 维）
-DBSCAN_EPS = 0.9          # DBSCAN 的 eps 参数
-DBSCAN_MIN_SAMPLES = 2    # DBSCAN 的 min_samples 参数
+# [已注释] DBSCAN 聚类方式已移除，改用 HDBSCAN 自动探测
+# DBSCAN_EPS = 0.9          # DBSCAN 的 eps 参数
+# DBSCAN_MIN_SAMPLES = 2    # DBSCAN 的 min_samples 参数
 
-# KMeans 固定聚类数：按降维方法分别配置，因为不同降维方法揭示的"自然簇数"不同
-# - PCA 是线性投影，不主动揭示簇结构 → 较大的 k 用来均匀切片
-# - UMAP 是非线性保拓扑，会把数据收缩成几个明显的"团" → k 应当 ≈ 团数
-# 对 50~120 step、10 agent 的场景，UMAP 的自然簇数大约 3~6
-KMEANS_K_FIXED_PCA = 7     # PCA 路径的经验值
-KMEANS_K_FIXED_UMAP = 4    # UMAP 路径，匹配 UMAP 的自然簇数
-KMEANS_K_FIXED = KMEANS_K_FIXED_PCA  # 向后兼容旧名
+# [已注释] 固定K值已移除，改用HDBSCAN自动探测
+# # KMeans 固定聚类数：按降维方法分别配置，因为不同降维方法揭示的"自然簇数"不同
+# # - PCA 是线性投影，不主动揭示簇结构 → 较大的 k 用来均匀切片
+# # - UMAP 是非线性保拓扑，会把数据收缩成几个明显的"团" → k 应当 ≈ 团数
+# # 对 50~120 step、10 agent 的场景，UMAP 的自然簇数大约 3~6
+# KMEANS_K_FIXED_PCA = 7     # PCA 路径的经验值
+# KMEANS_K_FIXED_UMAP = 4    # UMAP 路径，匹配 UMAP 的自然簇数
+# KMEANS_K_FIXED = KMEANS_K_FIXED_PCA  # 向后兼容旧名
 
 # HDBSCAN 配置：兼容两条降维路径（PCA + L2 / UMAP 不 L2）
 # - min_cluster_size=3：允许 3 个 step 的少数派错误小簇被正式识别为 wrong，
@@ -328,6 +332,8 @@ def _reduce_dimensions_umap(
 
 def _select_k_by_silhouette(vectors: np.ndarray) -> tuple[int, np.ndarray]:
     """
+    [已注释] 轮廓系数在小样本下不稳定，改用HDBSCAN自动探测
+
     根据轮廓系数选择 KMeans 的最优聚类数 k，并返回对应的聚类标签（避免重复运行 KMeans）
 
     轮廓系数范围 [-1, 1]，越接近 1 表示聚类效果越好。
@@ -339,50 +345,24 @@ def _select_k_by_silhouette(vectors: np.ndarray) -> tuple[int, np.ndarray]:
     Returns:
         (最优的聚类数 k, 对应的聚类标签数组)
     """
-    n_samples = vectors.shape[0]
-    if n_samples < 4:
-        kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
-        labels = kmeans.fit_predict(vectors)
-        return 2, labels
-    k_max = min(KMEANS_K_MAX, n_samples - 1)
-    best_k = 2
-    best_score = -1.0
-    best_labels = None
-    scores = []
-    for k in range(2, k_max + 1):
-        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-        labels = kmeans.fit_predict(vectors)
-        try:
-            score = silhouette_score(vectors, labels, metric="euclidean")
-        except Exception:
-            score = -1.0
-        scores.append((k, score))
-        if score > best_score:
-            best_score = score
-            best_k = k
-            best_labels = labels  # 保存当前 k 的标签，避免后续重复运行
-    print(f"[轮廓系数] 尝试 k=2..{k_max}, 最优 k={best_k} (轮廓系数={best_score:.4f})")
-    for k, s in scores:
-        mark = " <- 选中" if k == best_k else ""
-        print(f"  k={k}: 轮廓系数={s:.4f}{mark}")
-    return best_k, best_labels
+    # [已注释] 改用 HDBSCAN 自动探测自然簇数
+    raise NotImplementedError("轮廓系数选择K方法已禁用，请使用HDBSCAN自动探测")
 
 
 def _cluster_kmeans(
     vectors: np.ndarray,
-    n_clusters: Optional[int] = None,
+    n_clusters: int = 4,  # 默认值，避免未传参时报错
 ) -> np.ndarray:
     """KMeans 聚类。
 
     Args:
         vectors: 待聚类向量矩阵 (N, dim)
-        n_clusters: 期望聚类数；为 None 时使用 KMEANS_K_FIXED（向后兼容默认）。
-                    上层应根据降维方法传入合适的值（如 PCA→KMEANS_K_FIXED_PCA，
-                    UMAP→KMEANS_K_FIXED_UMAP）。
+        n_clusters: 期望聚类数；由上层通过 HDBSCAN 自动探测确定。
+                     exchange.py 中的 _resolve_kmeans_k_with_hdbscan 函数负责计算此值。
     """
     if vectors.shape[0] < 2:
         return np.array([0] * vectors.shape[0])
-    k_target = KMEANS_K_FIXED if n_clusters is None else n_clusters
+    k_target = n_clusters
     n_clusters_eff = min(k_target, vectors.shape[0])
     kmeans = KMeans(n_clusters=n_clusters_eff, random_state=42, n_init=10)
     labels = kmeans.fit_predict(vectors)
@@ -393,16 +373,17 @@ def _cluster_kmeans(
     return labels
 
 
-def _cluster_dbscan(vectors: np.ndarray, eps: float = 0.9, min_samples: int = 2) -> np.ndarray:
-    """DBSCAN 聚类"""
-    if vectors.shape[0] < 2:
-        return np.array([0] * vectors.shape[0])
-    dbscan = DBSCAN(eps=eps, min_samples=min_samples)
-    labels = dbscan.fit_predict(vectors)
-    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-    n_noise = list(labels).count(-1)
-    print(f"[DBSCAN] n_samples={vectors.shape[0]}, n_clusters={n_clusters}, 噪声点={n_noise}")
-    return labels
+# [已注释] DBSCAN 已移除，改用 HDBSCAN 自动探测
+# def _cluster_dbscan(vectors: np.ndarray, eps: float = 0.9, min_samples: int = 2) -> np.ndarray:
+#     """DBSCAN 聚类"""
+#     if vectors.shape[0] < 2:
+#         return np.array([0] * vectors.shape[0])
+#     dbscan = DBSCAN(eps=eps, min_samples=min_samples)
+#     labels = dbscan.fit_predict(vectors)
+#     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+#     n_noise = list(labels).count(-1)
+#     print(f"[DBSCAN] n_samples={vectors.shape[0]}, n_clusters={n_clusters}, 噪声点={n_noise}")
+#     return labels
 
 
 def _cluster_hdbscan(
@@ -413,10 +394,7 @@ def _cluster_hdbscan(
 ) -> np.ndarray:
     """HDBSCAN 聚类。
 
-    与 DBSCAN 的关键差异：
-      - 不需要全局 eps（避免 DBSCAN 跨题不通用的痛点）
-      - 通过分层互达密度自适应不同密度区域
-      - 噪声点用 -1 标识，下游与 DBSCAN 共用同一套 noise 处理逻辑
+    通过分层互达密度自适应发现不同密度的簇，噪声点用 -1 标识。
 
     后端兼容：优先 sklearn.cluster.HDBSCAN（sklearn>=1.3），
               否则 fallback 到独立 hdbscan 包；二者 API 接近，统一返回 labels 数组。
@@ -734,7 +712,7 @@ def _apply_cluster_labels_to_steps(
             "changed": bool,          # 是否发生了实际改变
         }
     """
-    # 深拷贝，避免修改原始数据影响后续 DBSCAN 的聚类标签计算
+    # 深拷贝，避免修改原始数据
     steps_copy = copy.deepcopy(all_steps)
     modified_count = 0
     change_records = []  # 记录每个 step 在本次修改中的变更情况
@@ -926,34 +904,35 @@ async def run_clustering():
         steps_after_kmeans, "KMeans", n_modified_kmeans
     )
 
-    # 5. DBSCAN 聚类
-    print("\n" + "-" * 60)
-    print("[聚类2] DBSCAN")
-    print("-" * 60)
-    labels_dbscan = _cluster_dbscan(
-        vectors_reduced,
-        eps=DBSCAN_EPS,
-        min_samples=DBSCAN_MIN_SAMPLES,
-    )
-    cluster_labels_dbscan = _label_clusters_by_majority(
-        labels_dbscan, step_indices, all_steps,
-        majority_threshold=MAJORITY_THRESHOLD,
-        method_name="DBSCAN",
-    )
-    _print_clustering_results(
-        labels_dbscan, cluster_labels_dbscan,
-        step_indices, all_steps, "DBSCAN",
-    )
-    # 根据聚类标签更新 step：correct 类簇内的 step 置为正确，wrong 类簇保持原标签
-    steps_after_dbscan, n_modified_dbscan, changes_dbscan = _apply_cluster_labels_to_steps(
-        labels_dbscan, cluster_labels_dbscan, step_indices, all_steps
-    )
-    # 打印每个聚类内 step 的原始标签 -> 修改后标签对比
-    _print_step_label_changes_by_cluster(changes_dbscan, "DBSCAN")
-    # 打印修改后所有 step 的整体标签视图（按 agent 分组）
-    _print_step_labels_after_modification(
-        steps_after_dbscan, "DBSCAN", n_modified_dbscan
-    )
+    # [已注释] DBSCAN 已移除
+    # # 5. DBSCAN 聚类
+    # print("\n" + "-" * 60)
+    # print("[聚类2] DBSCAN")
+    # print("-" * 60)
+    # labels_dbscan = _cluster_dbscan(
+    #     vectors_reduced,
+    #     eps=DBSCAN_EPS,
+    #     min_samples=DBSCAN_MIN_SAMPLES,
+    # )
+    # cluster_labels_dbscan = _label_clusters_by_majority(
+    #     labels_dbscan, step_indices, all_steps,
+    #     majority_threshold=MAJORITY_THRESHOLD,
+    #     method_name="DBSCAN",
+    # )
+    # _print_clustering_results(
+    #     labels_dbscan, cluster_labels_dbscan,
+    #     step_indices, all_steps, "DBSCAN",
+    # )
+    # # 根据聚类标签更新 step：correct 类簇内的 step 置为正确，wrong 类簇保持原标签
+    # steps_after_dbscan, n_modified_dbscan, changes_dbscan = _apply_cluster_labels_to_steps(
+    #     labels_dbscan, cluster_labels_dbscan, step_indices, all_steps
+    # )
+    # # 打印每个聚类内 step 的原始标签 -> 修改后标签对比
+    # _print_step_label_changes_by_cluster(changes_dbscan, "DBSCAN")
+    # # 打印修改后所有 step 的整体标签视图（按 agent 分组）
+    # _print_step_labels_after_modification(
+    #     steps_after_dbscan, "DBSCAN", n_modified_dbscan
+    # )
 
     # 6. 汇总
     print("\n" + "#" * 70)
@@ -962,7 +941,7 @@ async def run_clustering():
     print(f"  majority_threshold: {MAJORITY_THRESHOLD} (正确/错误占比 >= 60% 时生效)")
     print(f"  聚类标签规则: correct 类簇 -> 其内所有 step 置为正确; wrong 类簇 -> 保持原标签")
     print(f"  KMeans: 聚类数={len(set(labels_kmeans)) - (1 if -1 in labels_kmeans else 0)}, 修改 step 数={n_modified_kmeans}")
-    print(f"  DBSCAN: 聚类数={len(set(labels_dbscan)) - (1 if -1 in labels_dbscan else 0)}, 噪声点={list(labels_dbscan).count(-1)}, 修改 step 数={n_modified_dbscan}")
+    # print(f"  DBSCAN: 聚类数={len(set(labels_dbscan)) - (1 if -1 in labels_dbscan else 0)}, 噪声点={list(labels_dbscan).count(-1)}, 修改 step 数={n_modified_dbscan}")  # [已注释]
     print("#" * 70 + "\n")
 
 

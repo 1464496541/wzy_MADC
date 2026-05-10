@@ -2,7 +2,7 @@
 聚类标签修正后的 Exchange 流程（工具模块，由 wzy_multi_agent_debate_math.py 编排调用）
 
 提供的核心能力：
-1. PCA 降维 + KMeans/DBSCAN 聚类，用聚类标签修正 step 的 is_correct 标签
+1. UMAP/PCA 降维 + KMeans/HDBSCAN 聚类，用聚类标签修正 step 的 is_correct 标签
 2. 以 agent 为单位排序（全错 agent → 混合 agent → 全对 agent）
 3. 为每个 agent 构建 exchange prompt（排除自身 step，避免自我强化）
 4. 并发调用 API，让每个 agent 参考他人推理步骤更新答案
@@ -49,20 +49,23 @@ from wzy_multi_agent_debate_clustering import (
     _reduce_dimensions_pca,
     _reduce_dimensions_umap,
     _cluster_kmeans,
-    _cluster_dbscan,
+    # [已注释] DBSCAN 已移除，改用 HDBSCAN 自动探测
+    # _cluster_dbscan,
     _cluster_hdbscan,
     _label_clusters_by_majority,
     _diagnose_cluster_overmerge,
     _apply_cluster_labels_to_steps,
     MAJORITY_THRESHOLD,
     TARGET_DIM,
-    DBSCAN_EPS,
-    DBSCAN_MIN_SAMPLES,
+    # [已注释] DBSCAN 配置已移除
+    # DBSCAN_EPS,
+    # DBSCAN_MIN_SAMPLES,
     HDBSCAN_MIN_CLUSTER_SIZE,
     HDBSCAN_MIN_SAMPLES,
     HDBSCAN_METRIC,
-    KMEANS_K_FIXED_PCA,
-    KMEANS_K_FIXED_UMAP,
+    # [已注释] 固定 K 值已移除，改用 HDBSCAN 自动探测
+    # KMEANS_K_FIXED_PCA,
+    # KMEANS_K_FIXED_UMAP,
     UMAP_N_COMPONENTS,
     UMAP_POST_L2,
     extract_answer_from_text,
@@ -79,14 +82,85 @@ EXCHANGE_CONCURRENT_LIMIT = 5  # exchange 阶段每批并发的 agent 数量上�
 DEFAULT_REDUCTION_METHOD = "pca"
 
 
-def _resolve_kmeans_k(reduction_method: str) -> int:
-    """根据降维方法选择 KMeans 的 k：
-    - pca  → KMEANS_K_FIXED_PCA（线性投影下经验值，保留全局结构）
-    - umap → KMEANS_K_FIXED_UMAP（UMAP 已揭示自然簇结构，k 应当与之匹配）
+# [已注释] 固定 K 值方法已移除，改用 HDBSCAN 自动探测
+# def _resolve_kmeans_k(reduction_method: str) -> int:
+#     """根据降维方法选择 KMeans 的 k：
+#     - pca  → KMEANS_K_FIXED_PCA（线性投影下经验值，保留全局结构）
+#     - umap → KMEANS_K_FIXED_UMAP（UMAP 已揭示自然簇结构，k 应当与之匹配）
+#     """
+#     if reduction_method == "umap":
+#         return KMEANS_K_FIXED_UMAP
+#     return KMEANS_K_FIXED_PCA
+
+
+# HDBSCAN 自动探测 K 的配置
+HDBSCAN_NOISE_THRESHOLD = 0.5  # 噪声占比阈值，超过则回退到固定值
+KMEANS_K_MIN = 2               # KMeans k 最小值
+KMEANS_K_MAX = 10               # KMeans k 最大值（约束范围避免极端情况）
+KMEANS_K_FALLBACK = 4          # HDBSCAN 失效时的回退值
+
+
+def _resolve_kmeans_k_with_hdbscan(vectors_reduced: np.ndarray, reduction_method: str = "umap") -> int:
     """
-    if reduction_method == "umap":
-        return KMEANS_K_FIXED_UMAP
-    return KMEANS_K_FIXED_PCA
+    基于 HDBSCAN 自动探测确定 KMeans 的 k 值。
+
+    策略：
+    - 仅在 UMAP 降维后使用（UMAP 的非线性 embedding 更适合 HDBSCAN 探测）
+    - PCA 路径直接回退到固定值（线性投影不适合 HDBSCAN 自适应）
+    - HDBSCAN 噪声 < 50% 时，用 HDBSCAN 探测到的簇数作为 k
+    - HDBSCAN 噪声 >= 50% 时，回退到固定值
+    - k 值限制在 [KMEANS_K_MIN, KMEANS_K_MAX] 范围内
+
+    Args:
+        vectors_reduced: 降维后的向量矩阵
+        reduction_method: 降维方法："pca" | "umap"
+
+    Returns:
+        KMeans 的 k 值
+    """
+    if reduction_method != "umap":
+        # PCA 路径：直接回退到固定值
+        k = KMEANS_K_FALLBACK
+        print(f"[KMeans K 选择] PCA 路径，回退到固定 k={k}")
+        return k
+
+    # UMAP 路径：使用 HDBSCAN 探测
+    try:
+        hdbscan_labels = _cluster_hdbscan(
+            vectors_reduced,
+            min_cluster_size=HDBSCAN_MIN_CLUSTER_SIZE,
+            min_samples=HDBSCAN_MIN_SAMPLES,
+            metric=HDBSCAN_METRIC,
+        )
+    except Exception as e:
+        print(f"[KMeans K 选择] HDBSCAN 失败 ({e})，回退到固定 k={KMEANS_K_FALLBACK}")
+        return KMEANS_K_FALLBACK
+
+    # 统计噪声比例
+    n_samples = len(hdbscan_labels)
+    n_noise = int(np.sum(hdbscan_labels == -1))
+    noise_ratio = n_noise / n_samples if n_samples > 0 else 0
+
+    # 统计簇数（排除噪声）
+    unique_labels = set(hdbscan_labels.tolist())
+    n_clusters = len(unique_labels) - (1 if -1 in unique_labels else 0)
+
+    if noise_ratio < HDBSCAN_NOISE_THRESHOLD:
+        # 噪声比例可接受，使用 HDBSCAN 探测到的簇数
+        k = max(KMEANS_K_MIN, min(n_clusters, KMEANS_K_MAX))
+        print(
+            f"[KMeans K 选择] HDBSCAN 探测到 {n_clusters} 个簇 "
+            f"(噪声={noise_ratio:.1%} < {HDBSCAN_NOISE_THRESHOLD:.1%})，使用 k={k}"
+        )
+        return k
+    else:
+        # 噪声比例过高，回退到固定值
+        k = KMEANS_K_FALLBACK
+        print(
+            f"[KMeans K 选择] HDBSCAN 噪声过多 ({noise_ratio:.1%} >= {HDBSCAN_NOISE_THRESHOLD:.1%})，"
+            f"回退到固定 k={k}"
+        )
+        return k
 
 
 def _resolve_target_dim(reduction_method: str) -> int:
@@ -520,17 +594,18 @@ def _print_exchange_round_results(agent_contexts: list, round_num: int):
     _round_tag = f"Exchange Round {round_num}"
     print(f"\n{'═'*80}")
     print(f"  [{_round_tag} - Step 8] 各 Agent 推理结果")
+    _v = "\u250c"; _h = "\u2500"; _pipe = "\u2502"; _corner = "\u2514"
     print(f"{'═'*80}")
     for _aidx, _ctx in enumerate(agent_contexts):
         _last_msg = _ctx[-1] if _ctx else {}
         _ex_resp = _last_msg.get("content", "")
-        print(f"\n  \u250c\u2500 Agent {_aidx} (回复长度: {len(_ex_resp)} 字符) {'\u2500'*40}")
+        print(f"\n  {_v}{_h} Agent {_aidx} (回复长度: {len(_ex_resp)} 字符) {_h*40}")
         if _ex_resp:
             for _line in _ex_resp.split("\n"):
-                print(f"  \u2502  {_line}")
+                print(f"  {_pipe}  {_line}")
         else:
-            print(f"  \u2502  (无内容)")
-        print(f"  \u2514{'\u2500'*70}")
+            print(f"  {_pipe}  (无内容)")
+        print(f"  {_corner}{_h*70}")
     print(f"{'═'*80}")
 
     _round_majority = _get_latest_exchange_majority(agent_contexts)
@@ -778,12 +853,12 @@ async def _run_single_cluster_exchange_round(
         all_steps: 含 is_correct 标签的 step 列表
         agent_contexts: 所有 agent 的对话上下文（原地追加）
         round_num: 当前轮次编号（仅用于日志标注）
-        use_method: 聚类方法："kmeans" | "dbscan" | "hdbscan"
+        use_method: 聚类方法："kmeans" | "hdbscan"（DBSCAN 已移除）
         bidirectional: True 时 correct 类簇全置 True、wrong 类簇全置 False；False 时仅 correct 类簇置 True
         reduction_method: 降维方法："pca" | "umap"
-            - pca  → 先 L2 → PCA → 再 L2（线性投影 + 单位球面，配 KMeans 较稳）
+            - pca  → 先 L2 → PCA → 再 L2（线性投影 + 单位球面）
             - umap → UMAP（cosine metric 内置标度无关，前后默认不做 L2，保留 manifold）
-            KMeans 时 k 按降维方法自适应（pca→7, umap→4）
+            KMeans 时 k 由 HDBSCAN 自动探测确定（仅 UMAP 路径），PCA 路径使用固定值
     """
     tag = (
         f"Bidirectional Exchange Round {round_num}"
@@ -822,17 +897,12 @@ async def _run_single_cluster_exchange_round(
     print(f"{'═'*80}")
 
     # ══════════════════════════════════════════════════════════
-    # Step 2: 聚类
+    # Step 2: 聚类（仅支持 KMeans 和 HDBSCAN，DBSCAN 已移除）
     # ══════════════════════════════════════════════════════════
     print(f"\n{'═'*80}")
     print(f"  [{tag} - Step 2] {use_method.upper()} 聚类")
     print(f"{'═'*80}")
-    if use_method == "dbscan":
-        print(f"    参数: eps={DBSCAN_EPS}, min_samples={DBSCAN_MIN_SAMPLES}")
-        cluster_labels_raw = _cluster_dbscan(
-            vectors_reduced, eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_SAMPLES
-        )
-    elif use_method == "hdbscan":
+    if use_method == "hdbscan":
         print(
             f"    参数: min_cluster_size={HDBSCAN_MIN_CLUSTER_SIZE}, "
             f"min_samples={HDBSCAN_MIN_SAMPLES}, metric={HDBSCAN_METRIC}"
@@ -844,8 +914,8 @@ async def _run_single_cluster_exchange_round(
             metric=HDBSCAN_METRIC,
         )
     else:
-        # KMeans: k 按降维方法自适应（pca→7, umap→4）
-        kmeans_k = _resolve_kmeans_k(reduction_method)
+        # KMeans: 使用 HDBSCAN 自动探测确定 k 值（仅 UMAP 路径有效）
+        kmeans_k = _resolve_kmeans_k_with_hdbscan(vectors_reduced, reduction_method)
         print(f"    参数: n_clusters={kmeans_k}（reduction_method={reduction_method}）")
         cluster_labels_raw = _cluster_kmeans(vectors_reduced, n_clusters=kmeans_k)
     print(f"{'═'*80}")
