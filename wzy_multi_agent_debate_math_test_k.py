@@ -20,6 +20,7 @@ import copy
 import io
 import json
 import sys
+from datetime import datetime
 
 
 def _init_stdio_utf8() -> None:
@@ -118,6 +119,49 @@ BATCH_MAX_QUESTIONS: Optional[int] = None
 # 0 = 静默（仅关键摘要 + 累计正确率），1 = 全量日志（调试单题）
 # 批量时建议 0；单题调试时设 1
 BATCH_VERBOSE: int = 0
+
+# ---------- 运行日志 ----------
+# True: 终端输出同时写入日志文件（类似 tee），无需每次在 PowerShell 手写重定向命令
+AUTO_TEE_LOG: bool = True
+# None: 自动按脚本名+时间戳生成；或手动指定固定文件名（如 "math_test_k.log"）
+TEE_LOG_FILE: Optional[str] = None
+
+
+class _TeeStream:
+    """将终端输出复制到文件，保持控制台可见。"""
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for stream in self._streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self):
+        for stream in self._streams:
+            stream.flush()
+
+    def isatty(self):
+        return any(getattr(stream, "isatty", lambda: False)() for stream in self._streams)
+
+
+def _enable_auto_tee_log() -> Optional[io.TextIOWrapper]:
+    if not AUTO_TEE_LOG:
+        return None
+
+    if TEE_LOG_FILE:
+        log_path = TEE_LOG_FILE
+    else:
+        base = os.path.splitext(os.path.basename(__file__))[0]
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = f"{base}_{ts}.log"
+
+    log_fp = open(log_path, "a", encoding="utf-8", buffering=1)
+    sys.stdout = _TeeStream(sys.stdout, log_fp)
+    sys.stderr = _TeeStream(sys.stderr, log_fp)
+    print(f"[日志] 已启用自动日志: {os.path.abspath(log_path)}")
+    return log_fp
 
 
 @contextlib.contextmanager
@@ -944,4 +988,9 @@ async def main_math() -> Optional[Dict[str, Any]]:
 
 
 if __name__ == "__main__":
-    asyncio.run(main_math())
+    _log_fp = _enable_auto_tee_log()
+    try:
+        asyncio.run(main_math())
+    finally:
+        if _log_fp is not None:
+            _log_fp.close()
