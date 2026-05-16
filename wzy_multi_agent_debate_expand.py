@@ -20,6 +20,7 @@
 
 import sys
 import io
+import errno
 import asyncio
 import time
 import re
@@ -96,16 +97,8 @@ IS_MATH = True
 API_URL = "https://api.zhizengzeng.com/v1"
 API_KEY = "sk-zk2177a2c734fd960f54241b24e15e59412692a93b02905b"
 # glm-4-flashx
-# MODEL_NAME = "glm-4-flashx"
-<<<<<<< HEAD
-# MODEL_TAG = ""
 MODEL_NAME = "glm-4-flashx"
 MODEL_TAG = "glm-4-flashx"
-=======
-# MODEL_TAG = "glm-4-flashx"
-MODEL_NAME = "qwen-turbo"
-MODEL_TAG = "qwen-turbo"
->>>>>>> 8f7ba01483c2d54ea14571884a8e68c756a0a0c5
 
 client = OpenAI(base_url=API_URL, api_key=API_KEY)
 async_client = AsyncOpenAI(base_url=API_URL, api_key=API_KEY)
@@ -652,6 +645,39 @@ def expand_print_step2_responses(agent_contexts: List[List[Dict[str, Any]]]) -> 
     print(f"{'═'*80}")
 
 
+def _replace_cache_file_best_effort(tmp_path: str, dest_path: str) -> None:
+    """Windows 上目标 JSON 常被杀毒/同步/其它句柄短暂占用，os.replace 易 WinError 5；带重试。"""
+    delay = 0.05
+    last_err: Optional[BaseException] = None
+    for attempt in range(40):
+        try:
+            os.replace(tmp_path, dest_path)
+            return
+        except PermissionError as e:
+            last_err = e
+        except OSError as e:
+            winerr = getattr(e, "winerror", None)
+            if winerr == 5 or e.errno in (errno.EACCES, errno.EPERM):
+                last_err = e
+            else:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                raise
+        time.sleep(delay)
+        delay = min(delay * 1.2, 0.45)
+    msg = (
+        f"无法将临时文件替换为 {dest_path}（已重试仍 PermissionError / 拒绝访问）。"
+        f"请关闭可能占用该文件的程序（资源管理器预览、Excel、同步盘、杀毒），再重跑本题。"
+        f" 合并结果仍保留在: {tmp_path}（可手工改名覆盖目标文件）。"
+    )
+    if last_err is not None:
+        raise PermissionError(msg) from last_err
+    raise PermissionError(msg)
+
+
 def expand_save_cache_if_enabled(
     save_cache: bool,
     question: str,
@@ -684,13 +710,13 @@ def expand_save_cache_if_enabled(
 
         merged[question] = [agent_contexts, ground_truth, question_id]
 
-        tmp_path = f"{cache_path}.tmp"
+        tmp_path = f"{cache_path}.{os.getpid()}.tmp"
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(merged, f, indent=2, ensure_ascii=False)
-            os.replace(tmp_path, cache_path)
-        except OSError:
-            if os.path.exists(tmp_path):
+            _replace_cache_file_best_effort(tmp_path, cache_path)
+        except OSError as e:
+            if os.path.exists(tmp_path) and not isinstance(e, PermissionError):
                 try:
                     os.remove(tmp_path)
                 except OSError:
